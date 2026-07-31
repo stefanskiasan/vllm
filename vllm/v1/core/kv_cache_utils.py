@@ -1286,9 +1286,14 @@ def _resolve_layout_for_groups(
             "dim, which cannot express layers with different page sizes "
             f"(page sizes: {sorted(page_sizes)})."
         )
-    if len(kv_cache_groups) > 1:
+    if len(kv_cache_groups) > 1 or (
+        cache_config is not None and cache_config.enable_extensible_kv_cache
+    ):
         # Groups overlay each other, so every group must agree on which bytes
         # belong to a block: the layer dim has to sit inside the block dim.
+        # The extensible KV cache likewise needs one uniform bytes-per-block
+        # stride to commit block prefixes, which layer-compact regions of
+        # different page sizes cannot provide.
         layout = require_block_outer_kv_cache_layout(cache_config)
     return layout
 

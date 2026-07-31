@@ -1613,6 +1613,10 @@ def test_get_kv_cache_config_one_worker():
     # pass max_model_len to pass check_enough_kv_cache_memory
     model_config = ModelConfig(max_model_len=16)
     vllm_config = VllmConfig(model_config=model_config)
+    # This test pins the direct (non-extensible) tensor geometry; the
+    # extensible KV cache forces a block-outermost layout for pages of
+    # different sizes.
+    vllm_config.cache_config.enable_extensible_kv_cache = False
 
     mem_per_block_per_layer = 16 * 2 * 64 * 4 * 2
     # all layers are full attention -> single group
