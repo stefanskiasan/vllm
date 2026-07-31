@@ -120,6 +120,10 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.utils.extensible_tensor import (
+    ExtensibleKVCacheBuffers,
+    ExtensibleTensor,
+)
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
@@ -609,6 +613,7 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self.extensible_kv_buffers: ExtensibleKVCacheBuffers | None = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
@@ -6546,6 +6551,7 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
+        dummy_encoder_cache: torch.Tensor | None = None
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
@@ -6557,6 +6563,14 @@ class GPUModelRunner(
             else:
                 mm_budget = self.mm_budget
                 assert mm_budget is not None
+                if mm_budget.encoder_cache_size > 0:
+                    # Reserve the encoder cache's worst-case footprint during
+                    # profiling so measured KV sizing accounts for it.
+                    dummy_encoder_cache = torch.empty(
+                        (mm_budget.encoder_cache_size, self.inputs_embeds_size),
+                        dtype=self.model_config.dtype,
+                        device=self.device,
+                    )
 
                 if (encoder_budget := mm_budget.get_encoder_budget()) > 0:
                     if not mm_budget.mm_max_toks_per_item:
@@ -6616,7 +6630,7 @@ class GPUModelRunner(
         else:
             output = None
         self._sync_device()
-        del hidden_states, output
+        del hidden_states, output, dummy_encoder_cache
         self.encoder_cache.clear()
         gc.collect()
 
@@ -6706,6 +6720,9 @@ class GPUModelRunner(
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
             delattr(self, "kv_cache_config")
+        if self.extensible_kv_buffers is not None:
+            self.extensible_kv_buffers.free()
+            self.extensible_kv_buffers = None
         self.cache_config.num_gpu_blocks = None
 
         for layer in self.compilation_config.static_forward_context.values():
@@ -7445,17 +7462,68 @@ class GPUModelRunner(
         kv_cache_config: KVCacheConfig,
         kernel_block_sizes: list[int],
         layout: KVCacheLayout,
+        extensible: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Allocate the KV cache and view it as [B, H, N, C] per layer."""
-        return allocate_and_reshape_kv_cache(
-            kv_cache_config,
-            self.device,
-            layout,
-            kernel_block_sizes,
+        """Allocate the KV cache and view it as [B, H, N, C] per layer.
+
+        With `extensible=True`, the backing allocation is a VMM buffer that
+        reserves the full capacity but commits only one block (per layout
+        segment); `extend_kv_cache` commits the rest after warmup.
+        """
+        if not extensible:
+            self.extensible_kv_buffers = None
+            return allocate_and_reshape_kv_cache(
+                kv_cache_config,
+                self.device,
+                layout,
+                kernel_block_sizes,
+            )
+
+        buffers: list[tuple[ExtensibleTensor, int]] = []
+        num_blocks = kv_cache_config.num_blocks
+
+        def reserve(size: int, num_segments: int) -> torch.Tensor:
+            buffer = ExtensibleTensor(
+                max_num_bytes=size,
+                device=self.device,
+                num_segments=num_segments,
+            )
+            buffers.append((buffer, size // (num_blocks * num_segments)))
+            return buffer.full_view()
+
+        kv_caches = allocate_and_reshape_kv_cache(
+            kv_cache_config, self.device, layout, kernel_block_sizes, reserve=reserve
         )
+        self.extensible_kv_buffers = ExtensibleKVCacheBuffers(buffers, num_blocks)
+        self.extensible_kv_buffers.commit(1)
+        return kv_caches
+
+    def extend_kv_cache(self, num_blocks: int, defragment: bool = False) -> None:
+        """Commit physical pages so the KV cache holds `num_blocks` blocks.
+
+        Grows the KV cache after CUDA graph capture, once the available memory
+        is known. No re-view is needed: the layers already view the full
+        capacity and each block stays at a fixed offset within its layout
+        segment, so captured graphs stay valid as more pages are mapped under
+        the stable base pointer. Newly committed blocks are zeroed.
+        """
+        if self.extensible_kv_buffers is None:
+            raise RuntimeError("extend_kv_cache requires an extensible KV cache.")
+        self.extensible_kv_buffers.commit(num_blocks, defragment=defragment)
+        self.kv_cache_config.num_blocks = num_blocks
+        logger.info("Extended KV cache to %d blocks.", num_blocks)
+
+    @property
+    def kv_cache_committed_bytes(self) -> int:
+        """Physically committed KV cache bytes (0 without extensible KV)."""
+        buffers = self.extensible_kv_buffers
+        return buffers.physical_bytes if buffers is not None else 0
 
     def initialize_kv_cache_tensors(
-        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int],
+        extensible: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Initialize the memory buffer for KV cache.
@@ -7471,7 +7539,7 @@ class GPUModelRunner(
 
         layout = get_kv_cache_layout()
         kv_caches = self._allocate_and_reshape_kv_cache(
-            kv_cache_config, kernel_block_sizes, layout=layout
+            kv_cache_config, kernel_block_sizes, layout=layout, extensible=extensible
         )
 
         # Set up cross-layer KV cache sharing
@@ -7522,6 +7590,7 @@ class GPUModelRunner(
         self,
         kv_cache_config: KVCacheConfig,
         is_profiling: bool = False,
+        extensible: bool = False,
     ) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -7554,7 +7623,7 @@ class GPUModelRunner(
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
         kv_caches = self.initialize_kv_cache_tensors(
-            kv_cache_config, kernel_block_sizes
+            kv_cache_config, kernel_block_sizes, extensible=extensible
         )
 
         if (
