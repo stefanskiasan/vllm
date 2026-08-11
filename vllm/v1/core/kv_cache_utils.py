@@ -1327,12 +1327,13 @@ def get_kv_cache_config_from_groups(
     dense = len(runs) == 1
     for byte_offset, layer_names, spec in runs:
         page = spec.page_size_bytes
-        if dense:
+        if dense or layout.is_layer_compact:
+            # A layer-compact run owns a contiguous region, so within it the
+            # run is its own dense allocation (this also places dims hoisted
+            # between L and B, e.g. LHBNC's head planes).
             layer_stride, block_stride = layer_kv_cache_strides(
                 spec, num_blocks, len(layer_names), layout
             )
-        elif layout.is_layer_compact:
-            layer_stride, block_stride = page * num_blocks, page
         else:
             layer_stride, block_stride = page, packed_block_stride
         kv_cache_tensors.append(

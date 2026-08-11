@@ -99,6 +99,11 @@ class WorkerBase:
         """Get specifications for KV cache implementation."""
         raise NotImplementedError
 
+    def get_resolved_kv_cache_layout(self) -> str | None:
+        """Layout published by this worker's backend selection, if any."""
+        cache_config = getattr(self.vllm_config, "cache_config", None)
+        return getattr(cache_config, "kv_cache_layout", None)
+
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Prepare model for execution through compilation/warmup.
 

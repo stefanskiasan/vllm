@@ -257,6 +257,25 @@ class EngineCore:
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
+        # Adopt the workers' resolved KV cache layout: the generated config's
+        # tensor strides bake the layout in, and under multiprocess executors
+        # the backend selection that resolves it runs only in the workers
+        # (e.g. ROCM_ATTN publishes LHBNC).
+        from vllm.v1.attention.backends.utils import adopt_kv_cache_layout
+
+        layouts = {
+            name
+            for name in self.model_executor.collective_rpc(
+                "get_resolved_kv_cache_layout"
+            )
+            if name is not None
+        }
+        assert len(layouts) <= 1, f"Workers disagree on KV cache layout: {layouts}"
+        if layouts:
+            layout_name = layouts.pop()
+            vllm_config.cache_config.kv_cache_layout = layout_name
+            adopt_kv_cache_layout(layout_name)
+
         # Some layers (e.g. Prefix LM attention) run non-causally and tag their
         # KV cache spec with ``non_causal=True``. The specs are collected here in
         # the engine-core process (the same process that builds the scheduler),

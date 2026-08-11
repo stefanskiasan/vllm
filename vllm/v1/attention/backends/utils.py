@@ -262,6 +262,17 @@ def initialize_kv_cache_layout(
         cache_config.kv_cache_layout = layout.name
 
 
+def adopt_kv_cache_layout(layout_name: str) -> None:
+    """Adopt a layout resolved in another process.
+
+    Backend selection resolves the layout in the workers; under multiprocess
+    executors the engine core must adopt it before generating the KV cache
+    config, whose tensor strides bake the layout in.
+    """
+    global _RESOLVED_KV_CACHE_LAYOUT
+    _RESOLVED_KV_CACHE_LAYOUT = _layout_from_name(layout_name)
+
+
 def require_block_outer_kv_cache_layout(cache_config=None) -> KVCacheLayout:
     """Publish a block-outermost layout for models that overlay cache groups.
 
