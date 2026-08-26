@@ -377,7 +377,33 @@ class ROCMAiterMLASparseMetadataBuilder(
 
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
-        self.topk_tokens = vllm_config.model_config.hf_config.index_topk
+        # The indexer emits the *buffer width*, not `index_topk`. Mirror the
+        # sizing that Glm5NextModel.__init__ uses for `topk_indices_buffer`:
+        # reserve room for the incomplete pool tail (`index_kpool - 1`), then
+        # round up to the sparse-MLA 128-column tiling. For GLM-5.3-Flash that
+        # is 2048 + 3 -> 2051 -> 2176. Without it,
+        # triton_convert_req_index_to_global_index asserts (shape[1]=2176 vs
+        # NUM_TOPK_TOKENS=2048) and `paged_kv_indices` is undersized.
+        #
+        # `index_topk`/`index_kpool` live under `text_config` for multimodal
+        # configs (DeepSeek-V4-Flash: top level, GLM-5.3-Flash: text_config),
+        # so resolve through hf_text_config first — the same convention
+        # CudaPlatform._get_indexer_block_alignment already follows.
+        hf_config = vllm_config.model_config.hf_config
+        text_config = getattr(hf_config, "text_config", None) or hf_config
+        index_topk = getattr(text_config, "index_topk", None) or getattr(
+            hf_config, "index_topk"
+        )
+        index_kpool = (
+            getattr(text_config, "index_kpool", None)
+            or getattr(hf_config, "index_kpool", 1)
+            or 1
+        )
+        buffer_width = index_topk + (index_kpool - 1 if index_kpool > 1 else 0)
+        sparse_topk_block_n = 128
+        self.topk_tokens = (
+            (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n
+        ) * sparse_topk_block_n
         # Bounds the KV-split heuristic (see `_sparse_decode_max_split`).
         self._num_compute_units = current_platform.num_compute_units()
         self.max_model_len_tensor = torch.tensor(
