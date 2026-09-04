@@ -779,6 +779,7 @@ def sparse_attn_indexer_kpool(
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
+                clean_logits=False,
             )
         else:
             from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits

@@ -603,6 +603,7 @@ def rocm_fp8_paged_mqa_logits(
     block_tables: torch.Tensor,
     schedule_metadata: torch.Tensor,
     max_model_len: int,
+    clean_logits: bool = True,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -620,6 +621,11 @@ def rocm_fp8_paged_mqa_logits(
         schedule_metadata: Returned by `get_paged_mqa_logits_metadata`;
             used to distribute work across SMs.
         max_model_len: Maximum sequence length used to size the logits output.
+        clean_logits: Replace non-finite entries in the (B * next_n,
+            max_model_len) output with -inf. Only needed when a consumer reads
+            past the per-row causal window; `top_k_per_row_decode` does not,
+            since it is given `next_n` and `seq_lens`. Mirrors the same
+            parameter on `fp8_fp4_paged_mqa_logits`.
 
     Returns:
         Logits tensor of shape [B * next_n, max_model_len], dtype
@@ -657,7 +663,8 @@ def rocm_fp8_paged_mqa_logits(
                 KVBlockSize=block_size,
                 WavePerEU=2,
             )
-            out_logits.nan_to_num_(float("-inf"))
+            if clean_logits:
+                out_logits.nan_to_num_(float("-inf"))
             return out_logits
         deepgemm_fp8_paged_mqa_logits_stage1 = (
             aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
