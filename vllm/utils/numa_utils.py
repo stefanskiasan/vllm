@@ -10,6 +10,7 @@ import ctypes
 import logging
 import multiprocessing
 import os
+import shutil
 import subprocess
 from contextlib import contextmanager
 from functools import cache
@@ -501,6 +502,18 @@ def _resolve_numactl_args(numactl_args: str) -> str:
                     candidate or "no binding",
                 )
             return candidate
+
+    # Even the empty candidate failed, which means `numactl` itself could not be
+    # executed -- it is not installed in the ROCm images, for example. Without
+    # this branch the requested binding is dropped with no log line at all (the
+    # warning above only fires when a *different* candidate succeeds), so the
+    # only way to notice that --numa-bind did nothing is to profile afterwards.
+    logger.warning(
+        "NUMA binding was requested, but `numactl` could not be executed%s. "
+        "Workers will start unbound. Install numactl in the image; if it is "
+        "present and still rejected, add --cap-add SYS_NICE.",
+        "" if shutil.which("numactl") else " (not found on PATH)",
+    )
     return ""
 
 
