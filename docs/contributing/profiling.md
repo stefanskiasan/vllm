@@ -84,6 +84,48 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 $ curl -X POST http://localhost:8000/stop_profile
 ```
 
+### On ROCm: check your rocprofiler-sdk version first
+
+Since torch 2.12 the Kineto GPU backend links `librocprofiler-sdk` (previously
+roctracer). **With rocprofiler-sdk 1.1.0 the resulting traces are misleading on
+gfx942/gfx950**: `hipGraphLaunch` inflates by more than an order of magnitude and
+the HIP graph fast path is disabled, so a profiled decode shows large gaps
+between kernels that do not exist in an unprofiled run. See
+[#53182](https://github.com/vllm-project/vllm/pull/53182), which bumped the
+version shipped in `docker/Dockerfile.rocm_base` and measured GPU utilization
+39.9 % → 97.8 % and gaps over 1 ms 578 → 2 on the same workload.
+
+If you build your own image, or use one based on ROCm ≤ 7.2.4 (whose packages
+still carry 1.1.0), check what is actually loaded:
+
+```console
+$ python3 -c "import torch"   # inside your container
+$ grep rocprofiler /proc/self/maps        # or, for a running worker:
+$ grep rocprofiler /proc/<worker-pid>/maps
+```
+
+Note that `stat -c %s /opt/rocm/lib/librocprofiler-sdk.so.1` reports the symlink
+length, not the file size — use `stat -L` if you are checking that way.
+
+To pick up the fixed 1.3.2 without rebuilding, mount it over the symlink
+(the file is present in recent `vllm/vllm-openai-rocm` images):
+
+```bash
+docker run ... \
+  -v /path/to/librocprofiler-sdk.so.1.3.2:/opt/rocm/lib/librocprofiler-sdk.so.1:ro \
+  -e ROCPROFILER_QUEUE_INTERPOSITION=0 \
+  ...
+```
+
+`ROCPROFILER_QUEUE_INTERPOSITION=0` is needed on gfx950, where 1.3.2 otherwise
+hangs at profiler start ([#54087](https://github.com/vllm-project/vllm/issues/54087));
+`docker/Dockerfile.rocm_base` sets it for the same reason.
+
+A quick sanity check on any trace, on any platform: compare wall time against
+summed kernel time. If idle time dominates while CUDA/HIP graphs are enabled,
+you are measuring the profiler, and absolute gap durations from that trace should
+not be used to size an optimization. Relative shares of kernel time remain usable.
+
 ## Profile with Triton Proton
 
 [Proton](https://github.com/triton-lang/triton/tree/main/third_party/proton)
