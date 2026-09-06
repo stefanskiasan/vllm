@@ -808,6 +808,23 @@ class K2HorizonMoVAAttention(nn.Module):
             scaling_factor=self.router_scaling_factor,
         )
 
+        # Quantized value experts (e.g. GPTQ int4) expose packed ``qweight``
+        # rather than a plain ``weight``, so the stacked fused kernel below --
+        # which reads ``expert.weight`` -- cannot be used. Fall back to running
+        # each expert's quantized projection and combining the selected top-k.
+        if getattr(self.v_experts[0], "weight", None) is None:
+            expert_out = torch.stack(
+                [F.silu(expert(hidden_states)[0]) for expert in self.v_experts],
+                dim=1,
+            )  # [num_tokens, num_experts, kv_size]
+            gather_index = selected_values.unsqueeze(-1).expand(
+                -1, -1, expert_out.size(-1)
+            )
+            selected = torch.gather(expert_out, 1, gather_index)
+            return (
+                selected * routing_weights.unsqueeze(-1).to(selected.dtype)
+            ).sum(dim=1)
+
         w1 = torch.stack(
             [expert.weight for expert in self.v_experts], dim=0
         ).contiguous()
